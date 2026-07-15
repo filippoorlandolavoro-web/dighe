@@ -49,6 +49,23 @@ def _row_to_dict(row):
     return result
 
 
+def _fetch_all(sql, params, dict_rows=True):
+    # try/finally on both conn and cur so a failure mid-query (transient
+    # Neon error, bad row, etc.) never leaks the connection - Neon's
+    # connection cap is small and Vercel instances are reused across
+    # invocations, so leaked connections accumulate quickly.
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor) if dict_rows else conn.cursor()
+        try:
+            cur.execute(sql, params)
+            return cur.fetchall()
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Aggregation logic (kept in this file, not a separate module, so Vercel's
 # Python bundler has no cross-file import to worry about).
@@ -156,37 +173,60 @@ def _max_field(items, field):
 
 
 def _year_stats_from_snapshots(snapshots):
-    """One year's 12 monthly snapshots -> aggregated year values + status,
-    before cross-year interpolation.
+    """One year's 12 monthly snapshots -> aggregated year values, an overall
+    status (drives rain/snow classification) and a per-field status for each
+    of quota/lordo/netto, before cross-year interpolation.
+
+    A single shared status cannot correctly describe all three level fields:
+    a dam can have 12 valid quota months and 0 valid lordo months in the same
+    year (see README_PROGETTO.md - some dams switched from reporting quota to
+    reporting only lordo over time), so quota/lordo/netto are each classified
+    independently from their own valid-month count.
     """
     valid_months = [s for s in snapshots if _month_is_valid(s)]
     n_valid = len(valid_months)
 
     result = {field: None for field in _YEAR_FIELDS}
-
-    if n_valid == 0:
-        return result, "missing"
+    field_status = {}
 
     for field in LEVEL_FIELDS:
+        field_valid_months = [s for s in snapshots if s[field] is not None]
+        n_field_valid = len(field_valid_months)
+        if n_field_valid == 0:
+            field_status[field] = "missing"
+        elif n_field_valid >= 6:
+            field_status[field] = "actual"
+        else:
+            field_status[field] = "estimated"
         result[field] = _average_field(snapshots, field)
 
-    if n_valid >= 6:
-        # "actual": full-year sum for rain/snow (missing months count as 0),
-        # true max across the valid months for the capacity fields.
-        result["quota_max_slm"] = _max_field(valid_months, "quota_max_slm")
-        result["lordo_max_mc"] = _max_field(valid_months, "lordo_max_mc")
+    # Capacity fields follow their own field's status (max is only ever
+    # reported alongside real readings for that field) - script.js
+    # deliberately never estimates max values ("Non stimiamo i valori massimi").
+    if field_status["quota_slm_attuale"] == "actual":
+        result["quota_max_slm"] = _max_field(
+            [s for s in snapshots if s["quota_slm_attuale"] is not None], "quota_max_slm")
+    if field_status["lordo_mc_attuale"] == "actual":
+        result["lordo_max_mc"] = _max_field(
+            [s for s in snapshots if s["lordo_mc_attuale"] is not None], "lordo_max_mc")
+
+    if n_valid == 0:
+        overall_status = "missing"
+    elif n_valid >= 6:
+        # "actual": full-year sum for rain/snow (missing months count as 0).
+        overall_status = "actual"
         result["pioggia_mm_attuale"] = sum(s["pioggia_mm_attuale"] or 0 for s in snapshots)
         result["neve_cm_attuale"] = sum(s["neve_cm_attuale"] or 0 for s in snapshots)
-        return result, "actual"
+    else:
+        # "estimated" (1-5 valid months): extrapolate rain/snow from the
+        # average of the valid months x12.
+        overall_status = "estimated"
+        avg_pioggia = _average_field(valid_months, "pioggia_mm_attuale")
+        avg_neve = _average_field(valid_months, "neve_cm_attuale")
+        result["pioggia_mm_attuale"] = avg_pioggia * 12 if avg_pioggia is not None else None
+        result["neve_cm_attuale"] = avg_neve * 12 if avg_neve is not None else None
 
-    # "estimated" (1-5 valid months): extrapolate rain/snow from the average
-    # of the valid months x12. Capacity fields are left null - script.js
-    # deliberately never estimates max values ("Non stimiamo i valori massimi").
-    avg_pioggia = _average_field(valid_months, "pioggia_mm_attuale")
-    avg_neve = _average_field(valid_months, "neve_cm_attuale")
-    result["pioggia_mm_attuale"] = avg_pioggia * 12 if avg_pioggia is not None else None
-    result["neve_cm_attuale"] = avg_neve * 12 if avg_neve is not None else None
-    return result, "estimated"
+    return result, overall_status, field_status
 
 
 def _interpolate_years(years, field):
@@ -218,11 +258,21 @@ def _interpolate_years(years, field):
     return interpolated_indices
 
 
+_FIELD_STATUS_KEY = {
+    "quota_slm_attuale": "quota_status",
+    "lordo_mc_attuale": "lordo_status",
+    "netto_mc_attuale": "netto_status",
+}
+
+
 def compute_complete_years(rows, start_year, end_year):
     """Full 1998-today aggregation for the "Completa" view.
 
-    Returns one entry per year with quota/lordo/netto/max/pioggia/neve plus a
-    `status` of "actual" | "estimated" | "interpolated" | "missing".
+    Returns one entry per year with quota/lordo/netto/max/pioggia/neve, an
+    overall `status` (drives rain/snow classification), and a per-field
+    `quota_status`/`lordo_status`/`netto_status` - each independently
+    "actual" | "estimated" | "interpolated" | "missing" - since the three
+    level fields can have different data availability in the same year.
     """
     rows_by_year = {y: [] for y in range(start_year, end_year + 1)}
     for row in rows:
@@ -233,18 +283,31 @@ def compute_complete_years(rows, start_year, end_year):
     years = []
     for y in range(start_year, end_year + 1):
         snapshots = monthly_snapshots(rows_by_year[y])
-        stats, status = _year_stats_from_snapshots(snapshots)
-        years.append({"year": y, "status": status, **stats})
+        stats, status, field_status = _year_stats_from_snapshots(snapshots)
+        years.append({
+            "year": y,
+            "status": status,
+            "quota_status": field_status["quota_slm_attuale"],
+            "lordo_status": field_status["lordo_mc_attuale"],
+            "netto_status": field_status["netto_mc_attuale"],
+            **stats,
+        })
 
-    interpolated = [False] * len(years)
+    interpolated = {field: set() for field in LEVEL_FIELDS}
     for field in LEVEL_FIELDS:
-        touched = _interpolate_years(years, field)
-        for i in touched:
-            interpolated[i] = True
+        interpolated[field] = _interpolate_years(years, field)
 
-    for i, year in enumerate(years):
-        if year["status"] == "missing" and interpolated[i]:
-            year["status"] = "interpolated"
+    for field in LEVEL_FIELDS:
+        status_key = _FIELD_STATUS_KEY[field]
+        for i in interpolated[field]:
+            if years[i][status_key] == "missing":
+                years[i][status_key] = "interpolated"
+
+    # The overall status (used for rain/snow) rides along with quota's,
+    # since quota is what the "Completa" view leans on most by default.
+    for i in interpolated["quota_slm_attuale"]:
+        if years[i]["status"] == "missing":
+            years[i]["status"] = "interpolated"
 
     return years
 
@@ -261,13 +324,8 @@ def root():
 
 @app.get("/dams")
 def get_dams():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM dighe;")
-    dams = [row[0] for row in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return {"dams": dams}
+    rows = _fetch_all("SELECT nome_diga FROM dighe ORDER BY nome_diga;", (), dict_rows=False)
+    return {"dams": [row[0] for row in rows]}
 
 
 @app.get("/reservoir-data/{nome_diga}")
@@ -277,64 +335,53 @@ def get_reservoir_data(
     month: Optional[int] = None,
     limit: int = 30,
 ):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
     if year is not None and month is not None:
-        cur.execute(
+        rows = _fetch_all(
             f"SELECT {_COLUMNS_SQL} FROM reservoir_data "
             "WHERE nome_diga = %s AND EXTRACT(YEAR FROM data) = %s AND EXTRACT(MONTH FROM data) = %s "
             "ORDER BY data ASC;",
             (nome_diga, year, month),
         )
     elif year is not None:
-        cur.execute(
+        rows = _fetch_all(
             f"SELECT {_COLUMNS_SQL} FROM reservoir_data "
             "WHERE nome_diga = %s AND EXTRACT(YEAR FROM data) = %s "
             "ORDER BY data ASC;",
             (nome_diga, year),
         )
     else:
-        cur.execute(
+        # No date filter: "most recent N readings", newest first - a
+        # different, intentional convention from the year/month branches
+        # above (which return chronological ASC order for charting). The
+        # Android app always passes year+month, so it never hits this branch.
+        rows = _fetch_all(
             f"SELECT {_COLUMNS_SQL} FROM reservoir_data "
             "WHERE nome_diga = %s ORDER BY data DESC LIMIT %s;",
             (nome_diga, limit),
         )
-    rows = [_row_to_dict(row) for row in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return {"reservoir_data": rows}
+    return {"reservoir_data": [_row_to_dict(row) for row in rows]}
 
 
 @app.get("/reservoir-data/{nome_diga}/annual")
 def get_reservoir_annual(nome_diga: str, year: int):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute(
+    rows = _fetch_all(
         f"SELECT {_COLUMNS_SQL} FROM reservoir_data "
         "WHERE nome_diga = %s AND EXTRACT(YEAR FROM data) = %s ORDER BY data ASC;",
         (nome_diga, year),
     )
-    rows = [_row_to_dict(row) for row in cur.fetchall()]
-    cur.close()
-    conn.close()
-    months = compute_annual_months(rows)
+    months = compute_annual_months([_row_to_dict(row) for row in rows])
     return {"nome_diga": nome_diga, "year": year, "months": months}
 
 
 @app.get("/reservoir-data/{nome_diga}/complete")
 def get_reservoir_complete(nome_diga: str):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute(
+    rows = _fetch_all(
         f"SELECT {_COLUMNS_SQL} FROM reservoir_data WHERE nome_diga = %s ORDER BY data ASC;",
         (nome_diga,),
     )
-    rows = [_row_to_dict(row) for row in cur.fetchall()]
-    cur.close()
-    conn.close()
     start_year = 1998
     end_year = date.today().year
-    years = compute_complete_years(rows, start_year, end_year)
+    years = compute_complete_years([_row_to_dict(row) for row in rows], start_year, end_year)
     return {
         "nome_diga": nome_diga,
         "start_year": start_year,
