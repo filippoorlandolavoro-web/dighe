@@ -23,8 +23,17 @@ RESERVOIR_FIELDS = [
 _COLUMNS_SQL = ", ".join(["data"] + RESERVOIR_FIELDS)
 
 FORECAST_PATH = Path(__file__).parent / "precipitation_forecast.json"
-with open(FORECAST_PATH, "r", encoding="utf-8") as f:
-    FORECAST_DATA = json.load(f)
+_forecast_data_cache = None
+
+
+def _load_forecast_data():
+    # Lazy-loaded (not at import time) so a missing/unbundled file only
+    # breaks the forecast endpoint, not every route in the app.
+    global _forecast_data_cache
+    if _forecast_data_cache is None:
+        with open(FORECAST_PATH, "r", encoding="utf-8") as f:
+            _forecast_data_cache = json.load(f)
+    return _forecast_data_cache
 
 
 def get_db_connection():
@@ -135,7 +144,7 @@ def get_reservoir_complete(nome_diga: str):
 def get_precipitation_forecast(
     nome_diga: str, year: Optional[int] = None, month: Optional[int] = None
 ):
-    dam_forecast = FORECAST_DATA.get(nome_diga, {})
+    dam_forecast = _load_forecast_data().get(nome_diga, {})
     result = []
     for year_str, year_data in dam_forecast.items():
         if year is not None and int(year_str) != year:
