@@ -1,28 +1,51 @@
 
-from fastapi import FastAPI
-from pydantic import BaseModel
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import json
 import os
+from datetime import date
+from pathlib import Path
 from typing import Optional
+
+import psycopg2
+from fastapi import FastAPI
+from psycopg2.extras import RealDictCursor
+
+from aggregation import compute_annual_months, compute_complete_years
 
 app = FastAPI()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-class ReservoirData(BaseModel):
-    data: str
-    nome_diga: str
-    quota_slm_attuale: Optional[float]
-    netto_mc_attuale: Optional[float]
-    pioggia_mm_attuale: Optional[float]
+RESERVOIR_FIELDS = [
+    "quota_slm_attuale", "quota_slm_precedente", "quota_max_slm",
+    "lordo_mc_attuale", "lordo_mc_precedente", "lordo_max_mc",
+    "netto_mc_attuale", "netto_mc_precedente",
+    "var_giorno_attuale", "pioggia_mm_attuale", "neve_cm_attuale",
+]
+_COLUMNS_SQL = ", ".join(["data"] + RESERVOIR_FIELDS)
+
+FORECAST_PATH = Path(__file__).parent / "precipitation_forecast.json"
+with open(FORECAST_PATH, "r", encoding="utf-8") as f:
+    FORECAST_DATA = json.load(f)
+
 
 def get_db_connection():
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
+    return psycopg2.connect(DATABASE_URL)
+
+
+def _to_float(value):
+    return float(value) if hasattr(value, "normalize") else value
+
+
+def _row_to_dict(row):
+    result = {}
+    for key, value in row.items():
+        result[key] = value.isoformat() if key == "data" else _to_float(value)
+    return result
+
 
 @app.get("/")
 def root():
     return {"message": "Benvenuto nell'API dei dighe!"}
+
 
 @app.get("/dams")
 def get_dams():
@@ -34,20 +57,94 @@ def get_dams():
     conn.close()
     return {"dams": dams}
 
+
 @app.get("/reservoir-data/{nome_diga}")
-def get_reservoir_data(nome_diga: str, limit: int = 30):
+def get_reservoir_data(
+    nome_diga: str,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    limit: int = 30,
+):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    if year is not None and month is not None:
+        cur.execute(
+            f"SELECT {_COLUMNS_SQL} FROM reservoir_data "
+            "WHERE nome_diga = %s AND EXTRACT(YEAR FROM data) = %s AND EXTRACT(MONTH FROM data) = %s "
+            "ORDER BY data ASC;",
+            (nome_diga, year, month),
+        )
+    elif year is not None:
+        cur.execute(
+            f"SELECT {_COLUMNS_SQL} FROM reservoir_data "
+            "WHERE nome_diga = %s AND EXTRACT(YEAR FROM data) = %s "
+            "ORDER BY data ASC;",
+            (nome_diga, year),
+        )
+    else:
+        cur.execute(
+            f"SELECT {_COLUMNS_SQL} FROM reservoir_data "
+            "WHERE nome_diga = %s ORDER BY data DESC LIMIT %s;",
+            (nome_diga, limit),
+        )
+    rows = [_row_to_dict(row) for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return {"reservoir_data": rows}
+
+
+@app.get("/reservoir-data/{nome_diga}/annual")
+def get_reservoir_annual(nome_diga: str, year: int):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute(
-        "SELECT data, quota_slm_attuale, netto_mc_attuale, pioggia_mm_attuale FROM reservoir_data WHERE nome_diga = %s ORDER BY data DESC LIMIT %s;",
-        (nome_diga, limit)
+        f"SELECT {_COLUMNS_SQL} FROM reservoir_data "
+        "WHERE nome_diga = %s AND EXTRACT(YEAR FROM data) = %s ORDER BY data ASC;",
+        (nome_diga, year),
     )
-    data = cur.fetchall()
+    rows = [_row_to_dict(row) for row in cur.fetchall()]
     cur.close()
     conn.close()
-    # Convert Decimal to float for JSON serialization
-    for row in data:
-        for key, value in row.items():
-            if hasattr(value, 'normalize'):
-                row[key] = float(value)
-    return {"reservoir_data": data}
+    months = compute_annual_months(rows)
+    return {"nome_diga": nome_diga, "year": year, "months": months}
+
+
+@app.get("/reservoir-data/{nome_diga}/complete")
+def get_reservoir_complete(nome_diga: str):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute(
+        f"SELECT {_COLUMNS_SQL} FROM reservoir_data WHERE nome_diga = %s ORDER BY data ASC;",
+        (nome_diga,),
+    )
+    rows = [_row_to_dict(row) for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    start_year = 1998
+    end_year = date.today().year
+    years = compute_complete_years(rows, start_year, end_year)
+    return {
+        "nome_diga": nome_diga,
+        "start_year": start_year,
+        "end_year": end_year,
+        "years": years,
+    }
+
+
+@app.get("/precipitation-forecast/{nome_diga}")
+def get_precipitation_forecast(
+    nome_diga: str, year: Optional[int] = None, month: Optional[int] = None
+):
+    dam_forecast = FORECAST_DATA.get(nome_diga, {})
+    result = []
+    for year_str, year_data in dam_forecast.items():
+        if year is not None and int(year_str) != year:
+            continue
+        for month_str, month_data in year_data.items():
+            if month is not None and int(month_str) != month:
+                continue
+            for day_str, mm in month_data.items():
+                iso_date = f"{int(year_str):04d}-{int(month_str):02d}-{int(day_str):02d}"
+                result.append({"data": iso_date, "pioggia_mm": mm})
+    result.sort(key=lambda r: r["data"])
+    return {"nome_diga": nome_diga, "forecast": result}
