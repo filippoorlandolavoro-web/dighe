@@ -1,16 +1,27 @@
 
 import json
 import os
+import smtplib
+import ssl
 from datetime import date
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
 
 import psycopg2
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from psycopg2.extras import RealDictCursor
+from pydantic import BaseModel
 
 app = FastAPI()
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# The contact form sends mail from/to this same address via Gmail SMTP using
+# an account App Password (not the account's normal login password) - the
+# recipient is never embedded in the app itself, only read from the server's
+# environment here.
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL")
+CONTACT_EMAIL_APP_PASSWORD = os.getenv("CONTACT_EMAIL_APP_PASSWORD")
 
 RESERVOIR_FIELDS = [
     "quota_slm_attuale", "quota_slm_precedente", "quota_max_slm",
@@ -407,3 +418,40 @@ def get_precipitation_forecast(
                 result.append({"data": iso_date, "pioggia_mm": mm})
     result.sort(key=lambda r: r["data"])
     return {"nome_diga": nome_diga, "forecast": result}
+
+
+class ContactMessage(BaseModel):
+    message: str
+
+
+def _send_contact_email(message: str):
+    if not CONTACT_EMAIL or not CONTACT_EMAIL_APP_PASSWORD:
+        raise RuntimeError("CONTACT_EMAIL / CONTACT_EMAIL_APP_PASSWORD not configured")
+
+    mail = MIMEText(message, "plain", "utf-8")
+    mail["Subject"] = "Nuovo messaggio da Dighe lucane (beta)"
+    mail["From"] = CONTACT_EMAIL
+    mail["To"] = CONTACT_EMAIL
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(CONTACT_EMAIL, CONTACT_EMAIL_APP_PASSWORD)
+        server.sendmail(CONTACT_EMAIL, [CONTACT_EMAIL], mail.as_string())
+
+
+@app.post("/contact")
+def post_contact(payload: ContactMessage):
+    # The app only ever sends free-text; the recipient address lives solely
+    # in this server's environment (CONTACT_EMAIL), never in the client APK.
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Messaggio vuoto")
+    if len(message) > 4000:
+        raise HTTPException(status_code=400, detail="Messaggio troppo lungo")
+
+    try:
+        _send_contact_email(message)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Impossibile inviare il messaggio")
+
+    return {"status": "ok"}
